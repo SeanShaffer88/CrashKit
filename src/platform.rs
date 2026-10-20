@@ -245,6 +245,7 @@ mod win {
         pub fn GetCurrentProcess() -> HANDLE;
         pub fn GetCurrentThreadId() -> u32;
         pub fn GetSystemTimeAsFileTime(ft: *mut u64);
+        pub fn GetLastError() -> u32;
     }
 
     #[link(name = "dbghelp")]
@@ -302,20 +303,34 @@ mod win {
             )
         };
         if ok == 0 {
+            let gle = unsafe { GetLastError() };
             return Err((
                 ERR_PLATFORM,
-                "MiniDumpWriteDump failed (check dbghelp availability and disk space)".to_string(),
+                format!("MiniDumpWriteDump failed (Win32 error {gle})"),
             ));
         }
         Ok(())
     }
 
     unsafe extern "system" fn filter_entry(info: *mut EXCEPTION_POINTERS) -> i32 {
-        // The crash path: no panics, no blocking locks, best effort only.
+        // The crash path: no panics, no lock held across the capture,
+        // best effort only. The dump is written by a dedicated capture
+        // thread: MiniDumpWriteDump called on the faulting thread from
+        // inside its own filter proved unreliable (CI, 2026-10-20: the
+        // call failed and left a 0-byte file), while a helper thread in
+        // the still-alive process — the pattern production crash
+        // handlers use — captures consistently. The exception records
+        // stay valid because the filter waits for the capture to
+        // finish before returning.
         const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
         let mut prev: usize = 0;
         if let Some(m) = STATE.get() {
-            if let Ok(mut g) = m.try_lock() {
+            // Snapshot under try_lock; never hold the lock during capture.
+            let snap = m.try_lock().ok().map(|g| {
+                prev = g.prev_filter;
+                (g.dir.clone(), g.app.clone(), g.preset, g.context.clone())
+            });
+            if let Some((dir, app, preset, context)) = snap {
                 let (code, addr) = if !info.is_null() && !(*info).ExceptionRecord.is_null() {
                     (
                         Some((*(*info).ExceptionRecord).ExceptionCode),
@@ -329,22 +344,44 @@ mod win {
                 };
                 let pid = std::process::id();
                 let tid = thread_id();
-                let name = dump_filename(&g.app, ts, pid);
-                let path = g.dir.join(&name);
-                if let Ok(flags) = dump_type_flags(g.preset) {
-                    let mei = MINIDUMP_EXCEPTION_INFORMATION {
-                        ThreadId: tid,
-                        ExceptionPointers: info,
-                        ClientPointers: 0,
-                    };
-                    if write_dump(&path, flags, Some(&mei), pid, tid).is_ok() {
-                        let sidecar =
-                            sidecar_json(&g.app, ts, pid, tid, code, addr, g.preset, &g.context);
-                        let _ = std::fs::write(path.with_extension("json"), sidecar);
-                        g.last_dump = Some(path.to_string_lossy().to_string());
+                let name = dump_filename(&app, ts, pid);
+                let path = dir.join(&name);
+                if let Ok(flags) = dump_type_flags(preset) {
+                    let info_usize = info as usize;
+                    let worker_path = path.clone();
+                    let worker = std::thread::spawn(move || {
+                        let mei = MINIDUMP_EXCEPTION_INFORMATION {
+                            ThreadId: tid,
+                            ExceptionPointers: info_usize as *mut EXCEPTION_POINTERS,
+                            ClientPointers: 0,
+                        };
+                        write_dump(&worker_path, flags, Some(&mei), pid, tid)
+                    });
+                    match worker.join() {
+                        Ok(Ok(())) => {
+                            let sidecar =
+                                sidecar_json(&app, ts, pid, tid, code, addr, preset, &context);
+                            let _ = std::fs::write(path.with_extension("json"), sidecar);
+                            if let Some(m2) = STATE.get() {
+                                if let Ok(mut g) = m2.try_lock() {
+                                    g.last_dump = Some(path.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                        Ok(Err((_, msg))) => {
+                            let _ = std::fs::write(
+                                dir.join("crashkit-error.txt"),
+                                format!("crash capture failed: {msg}\n"),
+                            );
+                        }
+                        Err(_) => {
+                            let _ = std::fs::write(
+                                dir.join("crashkit-error.txt"),
+                                "crash capture thread panicked\n",
+                            );
+                        }
                     }
                 }
-                prev = g.prev_filter;
             }
         }
         if prev != 0 {

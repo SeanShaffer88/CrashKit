@@ -237,6 +237,72 @@ mod win {
         pub ClientPointers: i32,
     }
 
+    /// Owned copies of the OS exception data (x64 sizes: EXCEPTION_RECORD
+    /// is 152 bytes; CONTEXT is 1232 bytes, 16-byte aligned). dbghelp
+    /// refused the OS-provided pointers with ERROR_NOACCESS (998) in CI
+    /// while accepting these copies — and copies stay valid regardless
+    /// of what the dispatcher does with its own buffers.
+    #[repr(C)]
+    pub struct ExceptionCopy {
+        pub record: [u8; 152],
+        #[allow(dead_code)]
+        pub record_padding: [u8; 8],
+        pub context: ContextCopy,
+        pub pointers: EXCEPTION_POINTERS,
+    }
+
+    #[repr(C, align(16))]
+    pub struct ContextCopy {
+        pub data: [u8; 1232],
+    }
+
+    // The copies are plain byte buffers plus pointers into the same
+    // allocation; the box is created on the faulting thread and owned
+    // exclusively by the capture thread for the duration of the call.
+    unsafe impl Send for ExceptionCopy {}
+
+    /// Copy the exception record + context out of `info`; None when the
+    /// pointers are unusable. The returned box must outlive the capture.
+    pub fn copy_exception(info: *mut EXCEPTION_POINTERS) -> Option<Box<ExceptionCopy>> {
+        if info.is_null() {
+            return None;
+        }
+        unsafe {
+            let rec_ptr = (*info).ExceptionRecord;
+            let ctx_ptr = (*info).ContextRecord;
+            if rec_ptr.is_null() || ctx_ptr.is_null() {
+                return None;
+            }
+            let mut copy = Box::new(ExceptionCopy {
+                record: [0u8; 152],
+                record_padding: [0u8; 8],
+                context: ContextCopy { data: [0u8; 1232] },
+                pointers: EXCEPTION_POINTERS {
+                    ExceptionRecord: std::ptr::null_mut(),
+                    ContextRecord: std::ptr::null_mut(),
+                },
+            });
+            std::ptr::copy_nonoverlapping(rec_ptr as *const u8, copy.record.as_mut_ptr(), 152);
+            std::ptr::copy_nonoverlapping(
+                ctx_ptr as *const u8,
+                copy.context.data.as_mut_ptr(),
+                1232,
+            );
+            // Repoint the copied record's chain at itself is unnecessary:
+            // dbghelp reads ExceptionRecord + ContextRecord from our
+            // EXCEPTION_POINTERS, which we aim at the copies.
+            copy.pointers.ExceptionRecord = copy.record.as_mut_ptr() as *mut EXCEPTION_RECORD;
+            copy.pointers.ContextRecord = copy.context.data.as_mut_ptr() as *mut c_void;
+            // The copied record's nested ExceptionRecord pointer still
+            // references the original chain; null it to keep dbghelp
+            // inside our buffers (the chain matters only for nested
+            // exceptions, which the sidecar does not model either).
+            let rec = copy.pointers.ExceptionRecord;
+            (*rec).ExceptionRecord = std::ptr::null_mut();
+            Some(copy)
+        }
+    }
+
     pub type UnhandledFilter = unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32;
 
     #[link(name = "kernel32")]
@@ -347,15 +413,37 @@ mod win {
                 let name = dump_filename(&app, ts, pid);
                 let path = dir.join(&name);
                 if let Ok(flags) = dump_type_flags(preset) {
-                    let info_usize = info as usize;
+                    // Copy the exception data into our own buffers while
+                    // still on the faulting thread; dbghelp reads the
+                    // copies (see ExceptionCopy). Fallback inside the
+                    // worker: if the with-info capture fails, retry
+                    // without exception info — a slightly thinner dump
+                    // beats no dump every time.
+                    let exc_copy = copy_exception(info);
                     let worker_path = path.clone();
-                    let worker = std::thread::spawn(move || {
-                        let mei = MINIDUMP_EXCEPTION_INFORMATION {
-                            ThreadId: tid,
-                            ExceptionPointers: info_usize as *mut EXCEPTION_POINTERS,
-                            ClientPointers: 0,
+                    let worker = std::thread::spawn(move || -> CResult<()> {
+                        let first = match &exc_copy {
+                            Some(copy) => {
+                                let mei = MINIDUMP_EXCEPTION_INFORMATION {
+                                    ThreadId: tid,
+                                    ExceptionPointers: &copy.pointers as *const EXCEPTION_POINTERS
+                                        as *mut EXCEPTION_POINTERS,
+                                    ClientPointers: 0,
+                                };
+                                write_dump(&worker_path, flags, Some(&mei), pid, tid)
+                            }
+                            None => write_dump(&worker_path, flags, None, pid, tid),
                         };
-                        write_dump(&worker_path, flags, Some(&mei), pid, tid)
+                        match first {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                if exc_copy.is_some() {
+                                    write_dump(&worker_path, flags, None, pid, tid)
+                                } else {
+                                    Err(e)
+                                }
+                            }
+                        }
                     });
                     match worker.join() {
                         Ok(Ok(())) => {

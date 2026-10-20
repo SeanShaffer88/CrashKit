@@ -96,6 +96,17 @@ fn crash_child_writes_dump() {
     }
     assert_eq!(dumps.len(), 1, "expected exactly one dump in {dir:?}");
     let bytes = std::fs::read(&dumps[0]).unwrap();
+    assert!(
+        bytes.len() > 100,
+        "dump too small ({} bytes); dir contents: {:?}; crashkit-error.txt: {}",
+        bytes.len(),
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.file_name()))
+            .collect::<Vec<_>>(),
+        std::fs::read_to_string(dir.join("crashkit-error.txt"))
+            .unwrap_or_else(|_| "<none>".to_string())
+    );
     assert_eq!(&bytes[0..4], b"MDMP");
     let sidecar = std::fs::read_to_string(dumps[0].with_extension("json")).unwrap();
     assert!(
